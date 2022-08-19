@@ -563,7 +563,12 @@ impl Song {
                     song.sample_array = child.join().unwrap()?;
                     return Ok(song);
                 }
-                Err(e) => warn!("error while decoding file '{}': {}", path.display(), e),
+                Err(e) => {
+                    return Err(BlissError::DecodingError(format!(
+                        "error decoding file: {}.",
+                        e,
+                    )))
+                }
             };
 
             loop {
