@@ -128,6 +128,8 @@ use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::Params;
 use rusqlite::Row;
+use rusqlite::types;
+use rusqlite::vtab;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -377,6 +379,7 @@ impl<Config: AppConfigTrait> Library<Config> {
             create_dir_all(config.base_config().config_path.parent().unwrap())?;
         }
         let sqlite_conn = Connection::open(&config.base_config().database_path)?;
+        vtab::array::load_module(&sqlite_conn).unwrap();
         sqlite_conn.execute(
             "
             create table if not exists song (
@@ -551,6 +554,72 @@ impl<Config: AppConfigTrait> Library<Config> {
             );
         }
         songs.truncate(playlist_length);
+        Ok(songs)
+    }
+
+    pub fn playlist_from_custom_fast<F, G, T: Serialize + DeserializeOwned + std::fmt::Debug>(
+        &self,
+        song_path: &str,
+        playlist_length: usize,
+        distance: G,
+        mut sort_by: F,
+        dedup: bool,
+    ) -> Result<Vec<LibrarySong<T>>>
+    where
+        F: FnMut(&LibrarySong<T>, &mut Vec<LibrarySong<T>>, G, fn(&LibrarySong<T>) -> Song),
+        G: DistanceMetric + Copy,
+    {
+        let first_song: LibrarySong<T> = self.song_from_path(song_path).map_err(|_| {
+            BlissError::ProviderError(format!("song '{song_path}' has not been analyzed"))
+        })?;
+        //let mut songs = self.songs_from_library()?;
+        // load songs with just features for sorting
+        let mut songs = self.get_stored_features()?;
+        sort_by(&first_song, &mut songs, distance, |s: &LibrarySong<T>| {
+            s.bliss_song.to_owned()
+        });
+        songs.truncate(playlist_length);
+
+        // hydrate selected songs with metadata ahead of dedup
+        let songs_statement = "
+            select
+                path, artist, title, album, album_artist,
+                track_number, genre, duration, version, extra_info, cue_path,
+                audio_file_path, id
+                from song
+                where id in rarray(?)
+                order by id
+            ";
+        let features_statement = "
+            select
+                feature, song_id
+                from feature
+                where song_id in rarray(?)
+                order by song_id, feature_index
+                ";
+        let song_ids = songs.iter().filter_map(|song| {
+            // TODO: path.starts_with() doesn't work like I would expect...
+            if !song.bliss_song.path.to_string_lossy().starts_with("song_id:") {
+                panic!(
+                    "song seen in queue_from_current_song_custom_fast doesn't have song_id set: {}", song.bliss_song.path.to_string_lossy()
+                )
+                    // song seen in queue_from_current_song_custom_fast doesn't have song_id set: song_id:8089
+            }
+            // TODO: handle parse errors?
+            song.bliss_song.path.to_string_lossy().to_string().get(8..).unwrap().parse::<i64>().ok()
+        }).collect::<Vec<i64>>();
+        let values = song_ids.iter().map(|i| types::Value::from(i.to_owned())).collect::<Vec<types::Value>>();
+        let params = params! [std::rc::Rc::new(values)];
+        songs = self._songs_from_statement(songs_statement, features_statement, params)?;
+
+        if dedup {
+            dedup_playlist_custom_distance_by_key(
+                &mut songs,
+                None,
+                distance,
+                |s: &LibrarySong<T>| s.bliss_song.to_owned(),
+            );
+        }
         Ok(songs)
     }
 
@@ -981,6 +1050,95 @@ impl<Config: AppConfigTrait> Library<Config> {
                 ";
         let params = params![self.config.base_config().features_version];
         self._songs_from_statement(songs_statement, features_statement, params)
+    }
+
+    /// Get stored features
+    ///
+    /// Like songs_from_library but without getting path, title etc.
+    fn get_stored_features<T: Serialize + DeserializeOwned>(
+        &self,
+    ) -> Result<Vec<LibrarySong<T>>> {
+        let sqlite_conn = self.sqlite_conn.lock().unwrap();
+        // todo: not checking for features analysed with old version on this path, in any case doing an
+        // initial `select count(*) from song where version < $1;` would be faster than querying it
+        // with every song just to do an any() check.
+        // todo: can we compile the features into a list in sqlite (eg whatever array_agg
+        // alternatives, maybe) instead of doing the loop-over-hashmap thing?
+        // todo: other queries seem to be using database order to compile the features into an
+        // array instead of using feature_index, could that be problematic
+        let mut stmt = sqlite_conn
+            .prepare(
+                "
+                select
+                    song.id, feature, feature_index
+                    from feature
+                    inner join song
+                    on song.id = feature.song_id
+                    where song.analyzed = true;
+                ",
+            )
+            .map_err(|e| BlissError::ProviderError(e.to_string()))?;
+        let results = stmt
+            .query_map(
+                [],
+                |row| -> Result<
+                    (i64, f32, u16),
+                    RusqliteError,
+                > {
+                    let song_id = row.get(0)?;
+                    let feature = row.get(1)?;
+                    let feature_index = row.get(2)?;
+                    Ok((
+                        song_id,
+                        feature,
+                        feature_index,
+                    ))
+                },
+            )
+            .map_err(|e| BlissError::ProviderError(e.to_string()))?;
+
+        let mut songs_hashmap = HashMap::new();
+        for result in results {
+            let result = result.map_err(|e| BlissError::ProviderError(e.to_string()))?;
+            let song_entry = songs_hashmap.entry(result.0.to_owned()).or_insert_with(|| {
+                (
+                    vec![],
+                    result.2.to_owned(),
+                )
+            });
+            if result.2 as usize != song_entry.0.len() {
+                warn!(
+                    "Feature index queried in wrong order: song_id={} seen_count={} this_index={}",
+                    result.0, song_entry.0.len(), result.2,
+                );
+            }
+            song_entry.0.push(result.1);
+        }
+        songs_hashmap
+            .into_iter()
+            .map(
+                |(song_id, (analysis, _feature_index))| {
+                    let array: [f32; NUMBER_FEATURES] = analysis.try_into().map_err(|_| {
+                        BlissError::ProviderError(
+                            "Too many or too little features were provided at the end of \
+                        the analysis. You might be using an older version of blissify \
+                        with a newer bliss."
+                                .to_string(),
+                        )
+                    })?;
+                    let song = Song {
+                        // TODO: put song_id on Song instead of abusing path
+                        path: PathBuf::from(format!("song_id:{}", song_id)),
+                        analysis: Analysis::new(array),
+                        ..Default::default()
+                    };
+                    Ok(LibrarySong {
+                        bliss_song: song,
+                        extra_info: None.unwrap(),
+                    })
+                },
+            )
+            .collect::<Result<Vec<LibrarySong<_>>>>()
     }
 
     /// Get a LibrarySong from a given album title.
