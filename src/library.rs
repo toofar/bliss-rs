@@ -748,12 +748,21 @@ impl<Config: AppConfigTrait> Library<Config> {
                 .sqlite_conn
                 .lock()
                 .map_err(|e| BlissError::ProviderError(e.to_string()))?;
+            // TODO: move analyzed_only into a arg and plumb though from the
+            // blissify CLI as `update --force`.
+            let analyzed_only = false;
+            let where_clause = match analyzed_only {
+                true => "where song.analyzed = true and version = ?",
+                false => "where version = ?",
+            };
             let mut path_statement = connection.prepare(
-                "
+                &format!("
                 select
                     path
-                    from song where analyzed = true and version = ? order by id
-                ",
+                    from song
+                    {}
+                    order by id
+                ", where_clause),
             )?;
             #[allow(clippy::let_and_return)]
             let return_value = path_statement
