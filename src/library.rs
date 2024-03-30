@@ -435,6 +435,7 @@ impl<Config: AppConfigTrait> Library<Config> {
         let data = fs::read_to_string(config_path)?;
         let config = Config::deserialize_config(&data)?;
         let sqlite_conn = Connection::open(&config.base_config().database_path)?;
+        vtab::array::load_module(&sqlite_conn).unwrap();
         let mut library = Library {
             config,
             sqlite_conn: Arc::new(Mutex::new(sqlite_conn)),
@@ -611,6 +612,17 @@ impl<Config: AppConfigTrait> Library<Config> {
         let values = song_ids.iter().map(|i| types::Value::from(i.to_owned())).collect::<Vec<types::Value>>();
         let params = params! [std::rc::Rc::new(values)];
         songs = self._songs_from_statement(songs_statement, features_statement, params)?;
+        // TODO: we are losing the ordering from sort() when we got back to the DB to hydrate the
+        // songs above since we just fetch by ID. Unfortunately we can't re-order the array
+        // properly here because the bloodying song struct doesn't have the ID in it!!!
+        // Options:
+        // * add id to song struct
+        // * go back the doing the second query directly
+        //songs.sort_by(|a, b| {
+        //    song_ids.iter().position(|&r| r == a).unwrap().partial_cmp(
+        //        song_ids.iter().position(|&r| r == b).unwrap()
+        //    )
+        //});
 
         if dedup {
             dedup_playlist_custom_distance_by_key(
@@ -1141,9 +1153,21 @@ impl<Config: AppConfigTrait> Library<Config> {
                         analysis: Analysis::new(array),
                         ..Default::default()
                     };
+                    // This is cheating the type system, we aren't really returning a
+                    // LibrarySong(T) here, but I can't seem to get it working with a None::<T> or
+                    // anything. And if I return a plain Song that doesn't work because we are
+                    // passing the results to a user provided sort() function which is expecting a
+                    // LibrarySong<T>. It's unfortunate it doesn't seem to be possible to optimize
+                    // what data we load from the DB now that the library responsibility is split
+                    // between the library and the application. Especcially when, in the blissify
+                    // case, the LibrarySong typed sort function just calls a Song based one and
+                    // does nothing else. Perhaps it would be better if we used an Analysis based
+                    // sort function and allowed passing a custom dedup function to allow any
+                    // subsequent processing based on metadata?
+                    let extra_info = serde_json::from_str("null").unwrap();
                     Ok(LibrarySong {
                         bliss_song: song,
-                        extra_info: None.unwrap(),
+                        extra_info: extra_info,
                     })
                 },
             )
