@@ -537,10 +537,22 @@ impl<Config: AppConfigTrait> Library<Config> {
             })
             .collect::<Result<Vec<_>, BlissError>>()?;
         let mut songs = self.songs_from_library()?;
+        //warn!("First 10 songs in DB:");
+        //for i in 0..10 {
+        //    warn!("{}", songs[i].as_ref().path.display());
+        //}
         sort_by(&initial_songs, &mut songs, distance);
+        //warn!("After sorting:");
+        //for i in 0..10 {
+        //    warn!("{}", songs[i].as_ref().path.display());
+        //}
         if dedup {
             dedup_playlist_custom_distance(&mut songs, None, distance);
         }
+        //warn!("After dedup:");
+        //for i in 0..10 {
+        //    warn!("{}", songs[i].as_ref().path.display());
+        //}
         songs.truncate(playlist_length);
         Ok(songs)
     }
